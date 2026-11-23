@@ -6,7 +6,6 @@
 
 import "./styles.css";
 
-import ErrorBoundary from "@components/ErrorBoundary";
 import { Paragraph } from "@components/Paragraph";
 import definePlugin from "@utils/types";
 
@@ -80,8 +79,9 @@ export default definePlugin({
             // Discord's link click handler (same one OpenInApp uses). Kept short so OpenInApp's patch still matches.
             find: "trackAnnouncementMessageLinkClicked({",
             replacement: {
-                match: /function (\i)\(\i,\i\)\{(?=.{0,200}trusted:)/,
-                replace: "$&if($self.onLink(arguments,$1))return;"
+                match: /function \i\(\i,\i\)\{(?=.{0,200}trusted:)/,
+                // Discord shadows the function's own name with a local variable, so links.tsx looks the handler up via webpack.
+                replace: "$&if($self.onLink(arguments))return;"
             }
         }
     ],
@@ -98,8 +98,8 @@ export default definePlugin({
         RTC_CONNECTION_STATE: enforceCameraOff
     },
 
-    renderMessageAccessory: ErrorBoundary.wrap(({ message, isMessageSnapshot }: any) =>
-        isMessageSnapshot ? null : <AttachmentWarnings message={message} />, { noop: true }),
+    // Vencord wraps accessories in an ErrorBoundary already.
+    renderMessageAccessory: props => props.isMessageSnapshot ? null : <AttachmentWarnings message={props.message} />,
 
     start() {
         startCameraGuard();

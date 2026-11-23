@@ -96,7 +96,7 @@ export const settings = definePluginSettings({
     },
     metadataToast: {
         type: OptionType.BOOLEAN,
-        description: "Show a toast after metadata was removed",
+        description: "After uploading, show a notification with a button listing what was removed (GPS, camera, date taken...)",
         default: false
     },
 

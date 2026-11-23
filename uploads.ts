@@ -9,6 +9,7 @@ import { CloudUpload } from "@vencord/discord-types";
 import { showToast } from "@webpack/common";
 
 import { stripMetadata } from "./metadata";
+import { reportStripped } from "./removedDialog";
 import { FailurePolicy, settings } from "./settings";
 
 const logger = new Logger("DiscordOpsec");
@@ -46,7 +47,7 @@ export async function beforeUpload(upload: Upload): Promise<boolean> {
                 if (typeof upload.setFilename === "function") upload.setFilename(result.file.name);
                 else upload.filename = result.file.name;
             }
-            if (settings.store.metadataToast) showToast({ text: `Removed metadata from ${result.file.name}`, variant: "success" });
+            if (settings.store.metadataToast) reportStripped({ fileName: result.file.name, removed: result.removed });
         }
 
         // Discord sends an MD5 of the pre-conversion original (e.g. HEIC) as a header. That's a fingerprint of the original file.

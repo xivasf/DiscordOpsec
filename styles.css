@@ -107,3 +107,50 @@
     flex-direction: column;
     gap: 6px;
 }
+
+.vc-opsec-notif {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.vc-opsec-removed {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding-bottom: 8px;
+    color: var(--text-normal);
+}
+
+.vc-opsec-removed-file {
+    margin-bottom: 4px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.vc-opsec-removed table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.vc-opsec-removed td {
+    padding: 6px 8px;
+    border-top: 1px solid var(--background-modifier-accent);
+    vertical-align: top;
+}
+
+.vc-opsec-removed tr:first-child td {
+    border-top: none;
+}
+
+.vc-opsec-removed-name {
+    width: 40%;
+    font-weight: 600;
+}
+
+.vc-opsec-removed-value {
+    font-family: var(--font-code);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}

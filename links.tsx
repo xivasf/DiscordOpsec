@@ -5,12 +5,16 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { Alerts, showToast } from "@webpack/common";
+import { findByCodeLazy } from "@webpack";
+import { ConfirmModal, openModal, showToast } from "@webpack/common";
 
 import { LinkMode, Native, parseList, settings } from "./settings";
 
 const logger = new Logger("DiscordOpsec");
 const BYPASS = Symbol("DiscordOpsec.bypass");
+
+// Discord's link click handler (the patched one; the bypass marker lets calls through).
+const handleLinkClick = findByCodeLazy("trackAnnouncementMessageLinkClicked({") as (...a: any[]) => unknown;
 
 interface Reason {
     text: string;
@@ -217,7 +221,7 @@ async function blocklistReason(host: string): Promise<Reason | null> {
 
 // ---------- Warning dialog ----------
 
-function WarningBody({ url, reasons }: { url: URL; reasons: Reason[]; }) {
+function WarningBody({ url, reasons, onVirusTotal }: { url: URL; reasons: Reason[]; onVirusTotal?: () => void; }) {
     const href = url.href.length > 300 ? url.href.slice(0, 300) + "…" : url.href;
     return (
         <div className="vc-opsec-link">
@@ -226,6 +230,12 @@ function WarningBody({ url, reasons }: { url: URL; reasons: Reason[]; }) {
             {reasons.length
                 ? <ul>{reasons.map(r => <li key={r.text} className={r.danger ? "vc-opsec-reason-danger" : undefined}>{r.text}</li>)}</ul>
                 : <p>No warning signs found.</p>}
+            {onVirusTotal && (
+                <div>
+                    <button className="vc-opsec-btn" onClick={onVirusTotal}>Check URL on VirusTotal</button>
+                    <span className="vc-opsec-note"> sends this URL to VirusTotal</span>
+                </div>
+            )}
             <p className="vc-opsec-note">
                 These are local checks and public blocklists. A link without warnings can still be harmful, and a flagged one can be a false positive.
             </p>
@@ -235,17 +245,31 @@ function WarningBody({ url, reasons }: { url: URL; reasons: Reason[]; }) {
 
 function showWarning(url: URL, reasons: Reason[], proceed: () => void) {
     const danger = reasons.some(r => r.danger);
-    Alerts.show({
-        title: danger ? "Dangerous link" : reasons.length ? "Suspicious link" : "Leaving Discord",
-        body: <WarningBody url={url} reasons={reasons} />,
-        confirmText: "Open anyway",
-        cancelText: "Go back",
-        ...(Native && {
-            secondaryConfirmText: "Check URL on VirusTotal",
-            onConfirmSecondary: () => checkOnVirusTotal(url, reasons, proceed)
-        }),
-        onConfirm: proceed
-    });
+    const title = danger ? "Dangerous link" : reasons.length ? "Suspicious link" : "Leaving Discord";
+
+    try {
+        openModal(modalProps => (
+            <ConfirmModal
+                {...modalProps}
+                title={title}
+                confirmText="Open anyway"
+                cancelText="Go back"
+                variant="critical"
+                onConfirm={proceed}
+            >
+                <WarningBody
+                    url={url}
+                    reasons={reasons}
+                    onVirusTotal={Native ? () => { modalProps.onClose(); checkOnVirusTotal(url, reasons, proceed); } : undefined}
+                />
+            </ConfirmModal>
+        ));
+    } catch (e) {
+        // Never swallow the click silently: fall back to the browser's own prompt.
+        logger.error("Failed to open link warning, falling back to confirm()", e);
+        const text = `${title}\n\n${url.href}\n\n${reasons.map(r => "- " + r.text).join("\n") || "No warning signs found."}\n\nOpen anyway?`;
+        if (window.confirm(text)) proceed();
+    }
 }
 
 async function checkOnVirusTotal(url: URL, reasons: Reason[], proceed: () => void) {
@@ -278,9 +302,9 @@ async function checkOnVirusTotal(url: URL, reasons: Reason[], proceed: () => voi
 
 /**
  * Called at the top of Discord's link click handler. Returns true when the click was taken over.
- * `original` is that handler; it is re-invoked with a bypass marker and no event to continue normally.
+ * To continue, the handler is re-invoked with a bypass marker and no event.
  */
-export function onLinkClick(args: IArguments, original: (...a: any[]) => unknown): boolean {
+export function onLinkClick(args: IArguments): boolean {
     try {
         const [props, event] = args;
         if (!settings.store.linkWarnings || !props || props[BYPASS] || typeof props.href !== "string") return false;
@@ -299,9 +323,9 @@ export function onLinkClick(args: IArguments, original: (...a: any[]) => unknown
 
         const rest = Array.prototype.slice.call(args, 2);
         // Re-run Discord's handler, which still applies its own checks (blocked domains, "Leaving Discord" prompt).
-        const continueNormally = () => original({ ...props, [BYPASS]: true }, null, ...rest);
+        const continueNormally = () => handleLinkClick({ ...props, [BYPASS]: true }, null, ...rest);
         // The user already accepted our warning, so skip Discord's extra prompt.
-        const openDirectly = () => original({ ...props, onClick: undefined, trusted: true, shouldConfirm: false, [BYPASS]: true }, null, ...rest);
+        const openDirectly = () => handleLinkClick({ ...props, onClick: undefined, trusted: true, shouldConfirm: false, [BYPASS]: true }, null, ...rest);
 
         const reasons = analyzeUrl(url);
         const alwaysWarn = settings.store.linkMode === LinkMode.AllExternal;

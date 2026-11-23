@@ -7,6 +7,7 @@
 // Lossless metadata removal. Images are rebuilt from their original segments/chunks
 // so pixel data is never re-encoded. Videos have their metadata boxes overwritten
 // in place with zeroed "free" boxes so sample offsets stay valid.
+// Every strip function records a short human readable label for what it dropped.
 
 export interface StripOptions {
     keepColorProfile: boolean;
@@ -17,35 +18,105 @@ export interface StripOptions {
 export interface StripResult {
     file: File;
     changed: boolean;
+    /** What was removed, in the order it was found */
+    removed: RemovedItem[];
 }
+
+export interface RemovedItem {
+    /** e.g. "GPS location", "Camera", "XMP" */
+    name: string;
+    /** The value that was stored, when it is short and readable (e.g. "Apple iPhone 15 Pro") */
+    value?: string;
+}
+
+type Found = Map<string, string | undefined>;
+
+const add = (found: Found, name: string, value?: string) => {
+    if (!found.has(name)) found.set(name, value);
+};
 
 const ascii = (b: Uint8Array, start: number, len: number) => String.fromCharCode(...b.subarray(start, start + len));
 const u16be = (b: Uint8Array, p: number) => (b[p] << 8) | b[p + 1];
 const u32be = (b: Uint8Array, p: number) => ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;
 const u32le = (b: Uint8Array, p: number) => (b[p] | (b[p + 1] << 8) | (b[p + 2] << 16) | (b[p + 3] << 24)) >>> 0;
 
+function includesBytes(b: Uint8Array, s: string) {
+    const first = s.charCodeAt(0);
+    outer: for (let i = b.indexOf(first); i !== -1 && i + s.length <= b.length; i = b.indexOf(first, i + 1)) {
+        for (let j = 1; j < s.length; j++) if (b[i + j] !== s.charCodeAt(j)) continue outer;
+        return true;
+    }
+    return false;
+}
+
 class MalformedError extends Error { }
 const malformed = (what: string): never => { throw new MalformedError(`Malformed ${what}`); };
 
-// ---------- JPEG ----------
+// ---------- EXIF (TIFF structure) ----------
 
-function readExifOrientation(seg: Uint8Array): number {
-    // seg = FF E1 len(2) "Exif\0\0" TIFF...
-    if (seg.length < 18 || ascii(seg, 4, 4) !== "Exif") return 0;
-    const t = 10;
-    const le = seg[t] === 0x49;
-    const r16 = (p: number) => le ? seg[t + p] | (seg[t + p + 1] << 8) : u16be(seg, t + p);
-    const r32 = (p: number) => le ? u32le(seg, t + p) : u32be(seg, t + p);
-    const ifd = r32(4);
-    if (t + ifd + 2 > seg.length) return 0;
-    const count = r16(ifd);
-    for (let i = 0; i < count; i++) {
-        const e = ifd + 2 + i * 12;
-        if (t + e + 12 > seg.length) break;
-        if (r16(e) === 0x0112) return r16(e + 8);
-    }
-    return 0;
+/** Records what an EXIF block contains and returns its orientation (0 if none). Never throws. */
+function describeExif(t: Uint8Array, found: Found): number {
+    const before = found.size;
+    let orientation = 0;
+    try {
+        if (t.length < 8) throw 0;
+        const le = t[0] === 0x49;
+        const r16 = (p: number) => p + 2 <= t.length ? (le ? t[p] | (t[p + 1] << 8) : u16be(t, p)) : 0;
+        const r32 = (p: number) => p + 4 <= t.length ? (le ? u32le(t, p) : u32be(t, p)) : 0;
+
+        const readIfd = (off: number) => {
+            const entries = new Map<number, number>();
+            if (!off || off + 2 > t.length) return { entries, next: 0 };
+            const n = Math.min(r16(off), 512);
+            for (let i = 0; i < n; i++) {
+                const e = off + 2 + i * 12;
+                if (e + 12 > t.length) break;
+                entries.set(r16(e), e);
+            }
+            return { entries, next: r32(off + 2 + n * 12) };
+        };
+        const str = (m: Map<number, number>, tag: number) => {
+            const e = m.get(tag);
+            if (e == null) return "";
+            const count = r32(e + 4);
+            const at = count > 4 ? r32(e + 8) : e + 8;
+            if (!count || at + count > t.length) return "";
+            return ascii(t, at, Math.min(count, 80)).replace(/\0[\s\S]*$/, "").trim();
+        };
+        const sub = (m: Map<number, number>, tag: number) => m.has(tag) ? readIfd(r32(m.get(tag)! + 8)).entries : new Map<number, number>();
+
+        const ifd0 = readIfd(r32(4));
+        const tags = ifd0.entries;
+        const exif = sub(tags, 0x8769);
+        const gps = sub(tags, 0x8825);
+        if (tags.has(0x0112)) orientation = r16(tags.get(0x0112)! + 8);
+
+        if (gps.has(2) || gps.has(4)) add(found, "GPS location");
+        else if (gps.size) add(found, "GPS data");
+
+        const make = str(tags, 0x010F);
+        const model = str(tags, 0x0110);
+        if (make || model)
+            add(found, "Camera", model.toLowerCase().startsWith(make.toLowerCase()) ? model : [make, model].filter(Boolean).join(" "));
+
+        const date = str(exif, 0x9003) || str(tags, 0x0132);
+        if (date) add(found, "Date taken", date);
+        if (str(exif, 0xA431)) add(found, "Camera serial number");
+        const lens = str(exif, 0xA434);
+        if (lens) add(found, "Lens", lens);
+        const software = str(tags, 0x0131);
+        if (software) add(found, "Software", software);
+        if (str(tags, 0x013B)) add(found, "Author name");
+        if (str(tags, 0x8298)) add(found, "Copyright");
+        if (str(exif, 0xA420)) add(found, "Unique image ID");
+        if (str(exif, 0xA430)) add(found, "Camera owner name");
+        if (ifd0.next) add(found, "Embedded thumbnail");
+    } catch { }
+    if (found.size === before) add(found, "EXIF");
+    return orientation;
 }
+
+// ---------- JPEG ----------
 
 // Minimal APP1 carrying only the Orientation tag, so phone photos don't end up sideways.
 function orientationApp1(o: number) {
@@ -68,11 +139,25 @@ function keepJpegSegment(marker: number, seg: Uint8Array, opts: StripOptions) {
     return true;
 }
 
-function stripJpeg(b: Uint8Array, opts: StripOptions) {
+// Returns the orientation if the segment was EXIF.
+function describeJpegSegment(marker: number, seg: Uint8Array, found: Found): number {
+    if (marker === 0xE1) {
+        if (ascii(seg, 4, 6) === "Exif\0\0") return describeExif(seg.subarray(10), found);
+        add(found, ascii(seg, 4, 20).startsWith("http://ns.adobe.com/") ? "XMP" : "Vendor data");
+    } else if (marker === 0xE0) add(found, "Embedded thumbnail");
+    else if (marker === 0xE2) {
+        const id = ascii(seg, 4, 12);
+        add(found, id === "ICC_PROFILE\0" ? "Color profile" : id.startsWith("MPF") ? "Extra images (MPF)" : "Vendor data");
+    } else if (marker === 0xED) add(found, "IPTC/Photoshop data");
+    else if (marker === 0xFE) add(found, "Comment");
+    else add(found, "Vendor data");
+    return 0;
+}
+
+function stripJpeg(b: Uint8Array, opts: StripOptions, found: Found) {
     const parts: Uint8Array[] = [b.subarray(0, 2)];
     let insertAt = 1;
     let orientation = 0;
-    let changed = false;
     let pos = 2;
 
     while (pos < b.length) {
@@ -83,7 +168,7 @@ function stripJpeg(b: Uint8Array, opts: StripOptions) {
         if (marker === 0xD9) {
             parts.push(b.subarray(pos, pos + 2));
             // Anything after EOI is trailer data (MPF secondary images, vendor blobs) that carries its own metadata.
-            if (pos + 2 < b.length) changed = true;
+            if (pos + 2 < b.length) add(found, "Trailing data after the image");
             break;
         }
         if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
@@ -117,8 +202,8 @@ function stripJpeg(b: Uint8Array, opts: StripOptions) {
             parts.push(seg);
             if (marker === 0xE0 && parts.length === 2) insertAt = 2;
         } else {
-            changed = true;
-            if (marker === 0xE1 && !orientation) orientation = readExifOrientation(seg);
+            const o = describeJpegSegment(marker, seg, found);
+            if (!orientation) orientation = o;
         }
         pos = end;
     }
@@ -126,7 +211,7 @@ function stripJpeg(b: Uint8Array, opts: StripOptions) {
     if (opts.keepOrientation && orientation > 1 && orientation <= 8)
         parts.splice(insertAt, 0, orientationApp1(orientation));
 
-    return { parts, changed };
+    return parts;
 }
 
 // ---------- PNG ----------
@@ -136,32 +221,40 @@ const PNG_KEEP = new Set([
     "acTL", "fcTL", "fdAT"
 ]);
 
-function stripPng(b: Uint8Array, opts: StripOptions) {
+function stripPng(b: Uint8Array, opts: StripOptions, found: Found) {
     const parts: Uint8Array[] = [b.subarray(0, 8)];
-    let changed = false;
     let pos = 8;
 
     while (pos + 12 <= b.length) {
-        const end = pos + 12 + u32be(b, pos);
+        const len = u32be(b, pos);
+        const end = pos + 12 + len;
         if (end > b.length) malformed("PNG");
         const type = ascii(b, pos + 4, 4);
+        const data = b.subarray(pos + 8, pos + 8 + len);
+
         if (PNG_KEEP.has(type) || (type === "iCCP" && opts.keepColorProfile)) parts.push(b.subarray(pos, end));
-        else changed = true;
+        else if (type === "eXIf") describeExif(data, found);
+        else if (type === "iTXt" && ascii(data, 0, 17) === "XML:com.adobe.xmp") add(found, "XMP");
+        else if (type === "tEXt" || type === "zTXt" || type === "iTXt") add(found, "Text fields");
+        else if (type === "tIME") add(found, "Modification time");
+        else if (type === "iCCP") add(found, "Color profile");
+        else add(found, `${type} chunk`);
+
         pos = end;
         if (type === "IEND") break;
     }
-    if (pos < b.length) changed = true;
-    return { parts, changed };
+    if (pos < b.length) add(found, "Trailing data after the image");
+    return parts;
 }
 
 // ---------- WebP ----------
 
 const WEBP_KEEP = new Set(["VP8 ", "VP8L", "VP8X", "ALPH", "ANIM", "ANMF"]);
 
-function stripWebp(b: Uint8Array, opts: StripOptions) {
+function stripWebp(b: Uint8Array, opts: StripOptions, found: Found) {
     const riffEnd = Math.min(b.length, 8 + u32le(b, 4));
     const chunks: Uint8Array[] = [];
-    let changed = riffEnd < b.length;
+    if (riffEnd < b.length) add(found, "Trailing data after the image");
     let pos = 12;
 
     while (pos + 8 <= riffEnd) {
@@ -173,12 +266,15 @@ function stripWebp(b: Uint8Array, opts: StripOptions) {
             let chunk = b.subarray(pos, Math.min(end, riffEnd));
             if (type === "VP8X") {
                 chunk = chunk.slice();
-                const flags = chunk[8] & ~(0x08 | 0x04 | (opts.keepColorProfile ? 0 : 0x20));
-                if (flags !== chunk[8]) changed = true;
-                chunk[8] = flags;
+                chunk[8] &= ~(0x08 | 0x04 | (opts.keepColorProfile ? 0 : 0x20));
             }
             chunks.push(chunk);
-        } else changed = true;
+        } else if (type === "EXIF") {
+            const data = b.subarray(pos + 8, pos + 8 + size);
+            describeExif(ascii(data, 0, 6) === "Exif\0\0" ? data.subarray(6) : data, found);
+        } else if (type === "XMP ") add(found, "XMP");
+        else if (type === "ICCP") add(found, "Color profile");
+        else add(found, `${type.trim()} chunk`);
         pos = end;
     }
 
@@ -186,16 +282,15 @@ function stripWebp(b: Uint8Array, opts: StripOptions) {
     const header = new Uint8Array(12);
     header.set(b.subarray(0, 12));
     new DataView(header.buffer).setUint32(4, body + 4, true);
-    return { parts: [header, ...chunks], changed };
+    return [header, ...chunks];
 }
 
 // ---------- GIF ----------
 
-function stripGif(b: Uint8Array) {
+function stripGif(b: Uint8Array, found: Found) {
     let pos = 13;
     if (b[10] & 0x80) pos += 3 * (1 << ((b[10] & 7) + 1));
     const parts: Uint8Array[] = [b.subarray(0, pos)];
-    let changed = false;
 
     const skipSubBlocks = (p: number) => {
         while (p < b.length && b[p] !== 0) p += b[p] + 1;
@@ -207,16 +302,15 @@ function stripGif(b: Uint8Array) {
         const intro = b[pos];
         if (intro === 0x3B) {
             parts.push(b.subarray(pos, pos + 1));
-            if (pos + 1 < b.length) changed = true;
+            if (pos + 1 < b.length) add(found, "Trailing data after the image");
             break;
         }
         if (intro === 0x21) {
             const label = b[pos + 1];
             const end = skipSubBlocks(pos + 2);
-            const keep = label === 0xF9 || label === 0x01
-                || (label === 0xFF && /^(NETSCAPE2\.0|ANIMEXTS1\.0)$/.test(ascii(b, pos + 3, 11)));
-            if (keep) parts.push(b.subarray(pos, end));
-            else changed = true;
+            const app = label === 0xFF ? ascii(b, pos + 3, 11) : "";
+            if (label === 0xF9 || label === 0x01 || /^(NETSCAPE2\.0|ANIMEXTS1\.0)$/.test(app)) parts.push(b.subarray(pos, end));
+            else add(found, label === 0xFE ? "Comment" : app.startsWith("XMP") ? "XMP" : "Application data");
             pos = end;
         } else if (intro === 0x2C) {
             let p = pos + 10;
@@ -226,7 +320,7 @@ function stripGif(b: Uint8Array) {
             pos = end;
         } else malformed("GIF");
     }
-    return { parts, changed };
+    return parts;
 }
 
 // ---------- ISO BMFF (MP4 / MOV) ----------
@@ -245,30 +339,40 @@ function boxHeader(b: Uint8Array, p: number, limit: number) {
     return { size, header, type: ascii(b, p + 4, 4) };
 }
 
-function toFree(b: Uint8Array, p: number, size: number, header: number) {
+function describeVideoBox(box: Uint8Array, found: Found) {
+    const before = found.size;
+    if (includesBytes(box, "\xA9xyz") || includesBytes(box, "com.apple.quicktime.location")) add(found, "GPS location");
+    if (includesBytes(box, "\xA9mak") || includesBytes(box, "\xA9mod") || includesBytes(box, "com.apple.quicktime.model")) add(found, "Device make/model");
+    if (includesBytes(box, "\xA9swr") || includesBytes(box, "com.apple.quicktime.software")) add(found, "Software");
+    if (includesBytes(box, "\xA9day") || includesBytes(box, "com.apple.quicktime.creationdate")) add(found, "Recording date");
+    if (includesBytes(box, "<x:xmpmeta")) add(found, "XMP");
+    if (found.size === before) add(found, "Video metadata tags");
+}
+
+function toFree(b: Uint8Array, p: number, size: number, header: number, found: Found) {
+    describeVideoBox(b.subarray(p + header, p + size), found);
     b.set([0x66, 0x72, 0x65, 0x65], p + 4); // "free"
     b.fill(0, p + header, p + size);
 }
 
 // Walks moov (and its trak children) in place. Returns true if anything was neutralised.
-function scrubContainer(b: Uint8Array, start: number, end: number): boolean {
+function scrubContainer(b: Uint8Array, start: number, end: number, found: Found): boolean {
     let changed = false;
     for (let p = start; p + 8 <= end;) {
         const { size, header, type } = boxHeader(b, p, end);
         if (NEUTRALISE.has(type)) {
-            toFree(b, p, size, header);
+            toFree(b, p, size, header, found);
             changed = true;
         } else if (type === "trak") {
-            changed = scrubContainer(b, p + header, p + size) || changed;
+            changed = scrubContainer(b, p + header, p + size, found) || changed;
         }
         p += size;
     }
     return changed;
 }
 
-async function stripIsoVideo(file: Blob): Promise<{ parts: BlobPart[]; changed: boolean; }> {
+async function stripIsoVideo(file: Blob, found: Found): Promise<BlobPart[]> {
     const parts: BlobPart[] = [];
-    let changed = false;
     let last = 0;
     let pos = 0;
 
@@ -284,19 +388,18 @@ async function stripIsoVideo(file: Blob): Promise<{ parts: BlobPart[]; changed: 
             if (size > MAX_MOOV) throw new Error(`Video ${type} box too large to process`);
             const box = new Uint8Array(await file.slice(pos, pos + size).arrayBuffer());
             const touched = type === "moov"
-                ? scrubContainer(box, header, size)
-                : (toFree(box, 0, size, header), true);
+                ? scrubContainer(box, header, size, found)
+                : (toFree(box, 0, size, header, found), true);
             if (touched) {
                 parts.push(file.slice(last, pos), box);
                 last = pos + size;
-                changed = true;
             }
         }
         pos += size;
     }
 
     parts.push(file.slice(last));
-    return { parts, changed };
+    return parts;
 }
 
 // ---------- Fallback re-encode ----------
@@ -343,27 +446,28 @@ const MAX_IMAGE = 200 * 1024 * 1024;
  * and throws if a supported file could not be processed safely.
  */
 export async function stripMetadata(file: File, opts: StripOptions): Promise<StripResult> {
+    const unchanged = { file, changed: false, removed: [] };
     const kind = await detect(file);
-    if (kind == null) return { file, changed: false };
+    if (kind == null) return unchanged;
+
+    if (kind === "reencode")
+        return { file: await reencodeToPng(file), changed: true, removed: [{ name: "All metadata", value: "re-encoded to PNG" }] };
+
+    const found: Found = new Map();
+    let parts: BlobPart[];
 
     if (kind === "isovideo") {
-        if (!opts.videos) return { file, changed: false };
-        const { parts, changed } = await stripIsoVideo(file);
-        return changed
-            ? { file: new File(parts, file.name, { type: file.type }), changed }
-            : { file, changed: false };
+        if (!opts.videos) return unchanged;
+        parts = await stripIsoVideo(file, found);
+    } else {
+        if (file.size > MAX_IMAGE) throw new Error("Image too large to process");
+        const b = new Uint8Array(await file.arrayBuffer());
+        parts = (kind === "jpeg" ? stripJpeg(b, opts, found)
+            : kind === "png" ? stripPng(b, opts, found)
+                : kind === "webp" ? stripWebp(b, opts, found)
+                    : stripGif(b, found)) as BlobPart[];
     }
 
-    if (kind === "reencode") return { file: await reencodeToPng(file), changed: true };
-
-    if (file.size > MAX_IMAGE) throw new Error("Image too large to process");
-    const b = new Uint8Array(await file.arrayBuffer());
-    const { parts, changed } =
-        kind === "jpeg" ? stripJpeg(b, opts)
-            : kind === "png" ? stripPng(b, opts)
-                : kind === "webp" ? stripWebp(b, opts)
-                    : stripGif(b);
-
-    if (!changed) return { file, changed: false };
-    return { file: new File(parts as BlobPart[], file.name, { type: file.type }), changed: true };
+    if (!found.size) return unchanged;
+    return { file: new File(parts, file.name, { type: file.type }), changed: true, removed: [...found].map(([name, value]) => ({ name, value })) };
 }
