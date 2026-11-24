@@ -1,5 +1,7 @@
 # DiscordOpsec
-
+---my fork---
+what-to-add:metadata stripping from pdf, svg, audio files and ect. add integrity checks to discord hooks. improve cross-client compatibility. add middle click & right click & and embed click on a link pop up the opsec warning and any other ways the warning doesnt get displayed. sensitive info protections, eg-api keys ips and other sensitive info. scam detections such as mr beast and nitro scams. patch protections seeps from discord updates. and idk what else imma add some later. 
+-------------
 A Vencord plugin that closes a few privacy and security holes in Discord.
 
 - **Metadata stripping**: removes EXIF, GPS, XMP, comments and camera info from images before they upload. JPEG, PNG, WebP and GIF are edited losslessly (pixels untouched). HEIC/AVIF/TIFF get re-encoded to PNG. MP4/MOV location and device tags get wiped too.
